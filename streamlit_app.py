@@ -1,36 +1,112 @@
 import streamlit as st
 from PIL import Image
-import os
+import numpy as np
+from fpdf import FPDF
 
-# Título de la aplicación
-st.title("🧠 MRI Stroke Image Uploader")
+# Función simulada para predicción
+def fake_model_prediction(image_array):
+    return "Stroke Detectado"
 
-# Descripción de la aplicación
-st.write(
-    "Sube imágenes de resonancia magnética (MRI) relacionadas con el accidente cerebrovascular. "
-    "Puedes previsualizar las imágenes y procesarlas para análisis futuros."
-)
+# Función para generar un PDF con la imagen
+def generate_pdf_with_image(diagnosis, age, gender, image_path):
+    pdf = FPDF()
+    pdf.add_page()
+    pdf.set_font("Arial", size=12)
 
-# Sección de subida de archivos
-uploaded_files = st.file_uploader(
-    "Sube tus imágenes (formatos permitidos: JPEG, PNG, DICOM)",
-    type=["jpg", "jpeg", "png", "dcm"],
-    accept_multiple_files=True,
-)
+    # Título
+    pdf.set_font("Arial", 'B', size=16)
+    pdf.cell(200, 10, txt="Reporte de Diagnóstico de Stroke", ln=True, align='C')
+    pdf.ln(10)
 
-# Mostrar imágenes subidas
-if uploaded_files:
-    st.write("### Imágenes cargadas:")
-    for uploaded_file in uploaded_files:
-        try:
-            # Intentar abrir como imagen
-            image = Image.open(uploaded_file)
-            st.image(image, caption=uploaded_file.name, use_column_width=True)
-        except Exception:
-            st.warning(f"El archivo {uploaded_file.name} no es una imagen válida o no pudo abrirse.")
+    # Información general
+    pdf.set_font("Arial", size=12)
+    pdf.cell(200, 10, txt=f"Diagnóstico: {diagnosis}", ln=True)
+    pdf.cell(200, 10, txt=f"Edad: {age} años", ln=True)
+    pdf.cell(200, 10, txt=f"Sexo: {gender}", ln=True)
+    pdf.ln(10)
+
+    # Insertar la imagen
+    pdf.cell(200, 10, txt="Imagen analizada:", ln=True)
+    pdf.image(image_path, x=10, y=50, w=180)
+
+    pdf.ln(100)
+    pdf.cell(200, 10, txt="Gracias por usar nuestro sistema de diagnóstico.", ln=True, align='C')
+
+    return pdf
+
+# Inicializar estados de sesión
+if "diagnosis" not in st.session_state:
+    st.session_state.diagnosis = None
+if "image_array" not in st.session_state:
+    st.session_state.image_array = None
+if "uploaded_file_path" not in st.session_state:
+    st.session_state.uploaded_file_path = None
+if "age" not in st.session_state:
+    st.session_state.age = 30  # Valor por defecto
+if "gender" not in st.session_state:
+    st.session_state.gender = "Masculino"
+
+# Función para reiniciar el estado
+def reset_session_state():
+    st.session_state.diagnosis = None
+    st.session_state.image_array = None
+    st.session_state.uploaded_file_path = None
+    st.session_state.age = 30
+    st.session_state.gender = "Masculino"
+
+# Interfaz de usuario
+st.title("🧠 Diagnóstico de Stroke basado en MRI")
+st.write("Sube una imagen de resonancia magnética para obtener un diagnóstico detallado.")
+
+# Subir imagen
+uploaded_file = st.file_uploader("Sube una imagen (formatos: JPEG, PNG)", type=["jpg", "jpeg", "png"])
+if uploaded_file:
+    try:
+        # Mostrar la imagen
+        image = Image.open(uploaded_file)
+        st.image(image, caption="Imagen cargada", use_container_width=True)
+
+        # Guardar la imagen en un archivo temporal
+        st.session_state.uploaded_file_path = f"temp_{uploaded_file.name}"
+        image.save(st.session_state.uploaded_file_path)
+
+        # Convertir la imagen a numpy array para procesarla
+        st.session_state.image_array = np.array(image)
+
+        # Botón para obtener diagnóstico
+        if st.button("Obtener Diagnóstico"):
+            st.session_state.diagnosis = fake_model_prediction(st.session_state.image_array)
+            st.success(f"Diagnóstico obtenido: {st.session_state.diagnosis}")
+    except Exception as e:
+        st.error(f"Ocurrió un error al procesar la imagen: {e}")
 else:
-    st.write("No se han subido imágenes aún.")
+    # Reiniciar estado si no hay imagen
+    reset_session_state()
 
-# Botón para análisis futuro (placeholder)
-if st.button("Iniciar análisis"):
-    st.write("🔄 Funcionalidad de análisis aún no implementada.")
+# Mostrar resultados después del diagnóstico
+if st.session_state.diagnosis:
+    st.info(f"Diagnóstico: {st.session_state.diagnosis}")
+
+    # Solicitar edad y sexo
+    st.session_state.age = st.number_input("Ingresa la edad", min_value=0, max_value=120, value=st.session_state.age)
+    st.session_state.gender = st.selectbox("Selecciona el sexo", options=["Masculino", "Femenino", "Otro"], index=["Masculino", "Femenino", "Otro"].index(st.session_state.gender))
+
+    # Mostrar opción de generar informe
+    if st.button("Generar Informe"):
+        pdf = generate_pdf_with_image(
+            st.session_state.diagnosis,
+            st.session_state.age,
+            st.session_state.gender,
+            st.session_state.uploaded_file_path
+        )
+        pdf_output = f"reporte_diagnostico.pdf"
+        pdf.output(pdf_output)
+
+        # Descargar PDF
+        with open(pdf_output, "rb") as pdf_file:
+            st.download_button(
+                label="📄 Descargar Informe en PDF",
+                data=pdf_file,
+                file_name=pdf_output,
+                mime="application/pdf"
+            )
