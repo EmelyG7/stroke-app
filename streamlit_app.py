@@ -23,15 +23,13 @@ def generate_pdf_with_image(diagnosis, age, gender, image_path):
     pdf.cell(200, 10, txt=f"Diagnóstico: {diagnosis}", ln=True)
     pdf.cell(200, 10, txt=f"Edad: {age} años", ln=True)
     pdf.cell(200, 10, txt=f"Sexo: {gender}", ln=True)
-    pdf.ln(10)
+    pdf.ln(30)
 
     # Insertar la imagen
     pdf.cell(200, 10, txt="Imagen analizada:", ln=True)
     pdf.image(image_path, x=10, y=50, w=180)
 
     pdf.ln(100)
-    pdf.cell(200, 10, txt="Gracias por usar nuestro sistema de diagnóstico.", ln=True, align='C')
-
     return pdf
 
 # Inicializar estados de sesión
@@ -51,7 +49,7 @@ def reset_session_state():
     st.session_state.diagnosis = None
     st.session_state.image_array = None
     st.session_state.uploaded_file_path = None
-    st.session_state.age = 30
+    st.session_state.age = 1
     st.session_state.gender = "Masculino"
 
 # Interfaz de usuario
