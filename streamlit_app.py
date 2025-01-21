@@ -4,9 +4,15 @@ import numpy as np
 from tensorflow.keras.models import load_model
 from tensorflow.keras.preprocessing.image import img_to_array
 from fpdf import FPDF
+import os
 
 # Cargar el modelo entrenado
-MODEL_PATH = "modelo_resnet50_brain_data.h5"
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+MODEL_PATH = os.path.join(BASE_DIR, "modelo_resnet50_brain_data.h5")
+model = load_model(MODEL_PATH)
+
+if not os.path.exists(MODEL_PATH):
+    raise FileNotFoundError(f"El archivo del modelo no se encuentra en la ruta: {MODEL_PATH}")
 model = load_model(MODEL_PATH)
 
 # Clase predicha por el modelo
@@ -18,18 +24,22 @@ def predict_image_with_model(image_array):
     # Preprocesar la imagen
     IMG_SIZE = (224, 224)  # Tamaño esperado por el modelo
     image = img_to_array(image_array.resize(IMG_SIZE)) / 255.0
+    # Si la imagen tiene un solo canal (escala de grises), conviértela a 3 canales (color)
+    if image.shape[-1] == 1:
+        image = np.concatenate([image] * 3, axis=-1)  # Duplica el canal 1 tres veces
+
     image = np.expand_dims(image, axis=0)
 
     # Predicción
     prediction = model.predict(image)
     predicted_class = class_labels[np.argmax(prediction)]
-    confidence = np.max(prediction)
+    confidencee = np.max(prediction)
 
-    return predicted_class, confidence
+    return predicted_class, confidencee
 
 
 # Función para generar un PDF con la imagen cargada y el diagnóstico
-def generate_pdf_with_image(diagnosis, age, gender, image_path):
+def generate_pdf_with_image(diagnostico, age, gender, image_path):
     pdf = FPDF()
     pdf.add_page()
     pdf.set_font("Arial", size=12)
@@ -41,7 +51,7 @@ def generate_pdf_with_image(diagnosis, age, gender, image_path):
 
     # Información general
     pdf.set_font("Arial", size=12)
-    pdf.cell(200, 10, txt=f"Diagnóstico: {diagnosis}", ln=True)
+    pdf.cell(200, 10, txt=f"Diagnóstico: {diagnostico}", ln=True)
     pdf.cell(200, 10, txt=f"Edad: {age} años", ln=True)
     pdf.cell(200, 10, txt=f"Sexo: {gender}", ln=True)
     pdf.ln(30)
@@ -85,7 +95,7 @@ uploaded_file = st.file_uploader("Sube una imagen (formatos: JPEG, PNG)", type=[
 if uploaded_file:
     try:
         # Mostrar la imagen
-        image = Image.open(uploaded_file)
+        image = Image.open(uploaded_file).convert("RGB")
         st.image(image, caption="Imagen cargada", use_container_width=True)
 
         # Guardar la imagen en un archivo temporal
