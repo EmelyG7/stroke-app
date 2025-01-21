@@ -1,13 +1,34 @@
 import streamlit as st
 from PIL import Image
 import numpy as np
+from tensorflow.keras.models import load_model
+from tensorflow.keras.preprocessing.image import img_to_array
 from fpdf import FPDF
 
-# Función simulada para predicción
-def fake_model_prediction(image_array):
-    return "Stroke Detectado"
+# Cargar el modelo entrenado
+MODEL_PATH = "modelo_resnet50_brain_data.h5"
+model = load_model(MODEL_PATH)
 
-# Función para generar un PDF con la imagen
+# Clase predicha por el modelo
+class_labels = ["Normal", "Stroke"]
+
+
+# Función para predecir la clase utilizando el modelo entrenado
+def predict_image_with_model(image_array):
+    # Preprocesar la imagen
+    IMG_SIZE = (224, 224)  # Tamaño esperado por el modelo
+    image = img_to_array(image_array.resize(IMG_SIZE)) / 255.0
+    image = np.expand_dims(image, axis=0)
+
+    # Predicción
+    prediction = model.predict(image)
+    predicted_class = class_labels[np.argmax(prediction)]
+    confidence = np.max(prediction)
+
+    return predicted_class, confidence
+
+
+# Función para generar un PDF con la imagen cargada y el diagnóstico
 def generate_pdf_with_image(diagnosis, age, gender, image_path):
     pdf = FPDF()
     pdf.add_page()
@@ -32,6 +53,7 @@ def generate_pdf_with_image(diagnosis, age, gender, image_path):
     pdf.ln(100)
     return pdf
 
+
 # Inicializar estados de sesión
 if "diagnosis" not in st.session_state:
     st.session_state.diagnosis = None
@@ -44,6 +66,7 @@ if "age" not in st.session_state:
 if "gender" not in st.session_state:
     st.session_state.gender = "Masculino"
 
+
 # Función para reiniciar el estado
 def reset_session_state():
     st.session_state.diagnosis = None
@@ -51,6 +74,7 @@ def reset_session_state():
     st.session_state.uploaded_file_path = None
     st.session_state.age = 1
     st.session_state.gender = "Masculino"
+
 
 # Interfaz de usuario
 st.title("🧠 Diagnóstico de Stroke basado en MRI")
@@ -68,12 +92,13 @@ if uploaded_file:
         st.session_state.uploaded_file_path = f"temp_{uploaded_file.name}"
         image.save(st.session_state.uploaded_file_path)
 
-        # Convertir la imagen a numpy array para procesarla
-        st.session_state.image_array = np.array(image)
+        # Asignar la imagen al estado de sesión
+        st.session_state.image_array = image
 
         # Botón para obtener diagnóstico
         if st.button("Obtener Diagnóstico"):
-            st.session_state.diagnosis = fake_model_prediction(st.session_state.image_array)
+            diagnosis, confidence = predict_image_with_model(image)
+            st.session_state.diagnosis = f"{diagnosis} (Confianza: {confidence * 100:.2f}%)"
             st.success(f"Diagnóstico obtenido: {st.session_state.diagnosis}")
     except Exception as e:
         st.error(f"Ocurrió un error al procesar la imagen: {e}")
@@ -87,7 +112,8 @@ if st.session_state.diagnosis:
 
     # Solicitar edad y sexo
     st.session_state.age = st.number_input("Ingresa la edad", min_value=0, max_value=120, value=st.session_state.age)
-    st.session_state.gender = st.selectbox("Selecciona el sexo", options=["Masculino", "Femenino", "Otro"], index=["Masculino", "Femenino", "Otro"].index(st.session_state.gender))
+    st.session_state.gender = st.selectbox("Selecciona el sexo", options=["Masculino", "Femenino", "Otro"],
+                                           index=["Masculino", "Femenino", "Otro"].index(st.session_state.gender))
 
     # Mostrar opción de generar informe
     if st.button("Generar Informe"):
