@@ -47,6 +47,7 @@ for split in ["train", "val"]:
 
 # Por clase, dividir imágenes en train/val
 #Probando el GIT1
+#Probando el GIT222222
 for cls in classes:
     class_dir = os.path.join(base_dir, cls)
     images = os.listdir(class_dir)
