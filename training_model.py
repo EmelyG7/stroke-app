@@ -1,4 +1,5 @@
 import tensorflow as tf
+from sklearn.utils import class_weight
 from tensorflow.keras.preprocessing.image import ImageDataGenerator
 from tensorflow.keras.applications import ResNet50
 from tensorflow.keras.models import Model
@@ -7,17 +8,33 @@ from tensorflow.keras.optimizers import Adam
 from tensorflow.keras.callbacks import ReduceLROnPlateau
 from tensorflow.keras.layers import BatchNormalization
 from tensorflow.keras.callbacks import EarlyStopping
+# Añadir EfficientNet como modelo alternativo para pruebas
+from tensorflow.keras.applications import EfficientNetB0, EfficientNetB3
 from sklearn.metrics import classification_report
 import matplotlib.pyplot as plt
 import os
 import shutil
 from sklearn.model_selection import train_test_split
+from imblearn.over_sampling import RandomOverSampler
+import tensorflow as tf
 
+def focal_loss(alpha, gamma=2):
+    def focal_loss_fixed(y_true, y_pred):
+        y_pred = tf.clip_by_value(y_pred, 1e-7, 1 - 1e-7)
+        cross_entropy = tf.keras.losses.BinaryCrossentropy()(y_true, y_pred)
+        weight = alpha * y_true * (1 - y_pred)**gamma + (1 - alpha) * (1 - y_true) * y_pred**gamma
+        focal_loss = tf.reduce_mean(weight * cross_entropy)
+        return focal_loss
+    return focal_loss_fixed
 # Configuración
 IMG_SIZE = (224, 224)  # Tamaño de las imágenes que usa ResNet-50
 BATCH_SIZE = 16
 EPOCHS = 50
 NUM_CLASSES = 2  # Dos clases: Normal y Stroke
+class_weights = {
+    0: 1.0,  # Normal
+    1: 10.0   # Stroke
+}
 
 # Directorio base
 base_dir = "Brain_Data_Organised/"
@@ -59,11 +76,11 @@ print(f"Imágenes en 'val/Stroke': {val_stroke}")
 # Dividir automáticamente los datos de entrenamiento y validación (entrenamiento: 80%, validación: 20%)
 train_datagen = ImageDataGenerator(
     rescale=1.0 / 255,  # Normaliza los datos entre 0 y 1
-    rotation_range=30,  # Incrementa la rotación
-    width_shift_range=0.3,  # Permite mayores desplazamientos horizontales
-    height_shift_range=0.3,  # Permite mayores desplazamientos verticales
-    shear_range=0.3,  # Permite un mayor rango de inclinación
-    zoom_range=0.3,  # Aumenta el rango del zoom
+    rotation_range=45,  # Incrementa la rotación
+    width_shift_range=0.4,  # Permite mayores desplazamientos horizontales
+    height_shift_range=0.4,  # Permite mayores desplazamientos verticales
+    shear_range=0.4,  # Permite un mayor rango de inclinación
+    zoom_range=0.4,  # Aumenta el rango del zoom
     horizontal_flip=True,
     fill_mode="nearest"  # Rellena píxeles que falten tras transformaciones
 )
@@ -97,13 +114,16 @@ print("\nDistribución de validación:")
 for cls in classes:
     print(f"{cls}: {len(os.listdir(os.path.join(base_dir, 'val', cls)))} imágenes")
 
-# Cargar el modelo base ResNet-50 preentrenado en ImageNet
-base_model = ResNet50(weights="imagenet", include_top=False, input_shape=(IMG_SIZE[0], IMG_SIZE[1], 3))
+# Cargar el modelo base ResNet-50 y EfficientNetB0 preentrenado en ImageNet
+use_efficientnet = True  # Cambiar a True para probar EfficientNetB0
+base_model = EfficientNetB3(weights="imagenet", include_top=False, input_shape=(IMG_SIZE[0], IMG_SIZE[1], 3))
 
 # Congelar las capas base (para transfer learning)
-for layer in base_model.layers[-10:]:
-    layer.trainable = True
-
+# Ajustar capas base para fine-tuning avanzado
+base_model.trainable = True
+fine_tune_at = int(len(base_model.layers) * 0.7)  # Descongelar parcialmente el 30%
+for layer in base_model.layers[:fine_tune_at]:
+    layer.trainable = False
 # Añadir capas personalizadas en la parte superior
 x = Flatten()(base_model.output)
 x = Dense(256, activation="relu")(x)  # Incrementa la capacidad de esta capa
@@ -119,17 +139,23 @@ model = Model(inputs=base_model.input, outputs=output)
 
 # Compilar el modelo
 model.compile(
-    optimizer=Adam(learning_rate=0.0001),  # Optimizador con tasa de aprendizaje baja
-    loss="binary_crossentropy",  # Función de pérdida para clasificación binaria
-    metrics=["accuracy", tf.keras.metrics.Precision(name="precision"), tf.keras.metrics.Recall(name="recall")],  # Métrica de precisión
+    optimizer=Adam(learning_rate=0.0001),
+    loss=focal_loss(alpha=0.75, gamma=2.0),
+    metrics=["accuracy", "Precision", "Recall"]
 )
+# Preparar ajuste fino después de algunas épocas (descomentar cuando sea necesario)
+def fine_tune_model():
+    for layer in base_model.layers[-20:]:  # Ajustar solo últimas 20 capas
+        layer.trainable = True
+
 
 # Callback para reducir la tasa de aprendizaje si no mejora
 reduce_lr = ReduceLROnPlateau(
-    monitor="val_loss",  # Métrica que se monitoreará
-    factor=0.5,  # Reducir la tasa de aprendizaje a la mitad
-    patience=3,  # Esperar 3 épocas sin mejora
-    min_lr=1e-6  # Tasa mínima permitida
+    monitor="val_loss",
+    factor=0.5,
+    patience=3,
+    min_lr=1e-6,
+    verbose=1
 )
 
 early_stopping = EarlyStopping(
@@ -146,7 +172,9 @@ history = model.fit(
     train_generator,
     epochs=EPOCHS,
     validation_data=val_generator,
-    callbacks=callbacks
+    class_weight=class_weights,
+    callbacks=callbacks,
+    steps_per_epoch=train_generator.samples // BATCH_SIZE
 )
 
 # Evaluar el modelo
