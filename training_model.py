@@ -57,8 +57,8 @@ print("TensorFlow version:", tf.__version__)
 print("Keras version:", tf.keras.__version__)
 
 # Configuraciones globales
-IMG_SIZE = (160, 224)
-TARGET_SIZE = (160, 224, 3)
+IMG_SIZE = (160, 160)
+TARGET_SIZE = (160, 160, 3)
 BATCH_SIZE = 32
 EPOCHS = 60
 NUM_CLASSES = 2  # Normal y Stroke
@@ -69,9 +69,12 @@ LEARNING_RATE = 0.0003
 W_REGULARIZER = 1e-5
 PATIENCE = 7
 FACTOR = 0.3
+# Tamaño de imagenes en el modelo
+INPUT_SHAPE = (None, 128, 128, 3)
+
 
 # Definir optimizadores
-optimizers = [
+my_optimizers = [
     tf.keras.optimizers.Adam(learning_rate=LEARNING_RATE),
     tf.keras.optimizers.RMSprop(learning_rate=LEARNING_RATE, rho=0.9, epsilon=1e-08),
     tf.keras.optimizers.SGD(learning_rate=LEARNING_RATE),
@@ -114,7 +117,6 @@ data_augmentation = tf.keras.Sequential([
 ])
 
 base_dir = "Dataset/"
-batch_size = 32
 train_ds = tf.keras.utils.image_dataset_from_directory(
     os.path.join(base_dir, "train"),
     labels='inferred',
@@ -130,7 +132,7 @@ val_ds = tf.keras.utils.image_dataset_from_directory(
     labels='inferred',
     label_mode='binary',
     shuffle=False,
-    batch_size=batch_size
+    batch_size=BATCH_SIZE
 )
 
 test_ds = tf.keras.utils.image_dataset_from_directory(
@@ -138,7 +140,7 @@ test_ds = tf.keras.utils.image_dataset_from_directory(
     labels='inferred',
     label_mode='binary',
     shuffle=False,
-    batch_size=batch_size
+    batch_size=BATCH_SIZE
 )
 
 print(len(train_ds))
@@ -218,7 +220,7 @@ model.summary()
 
 model.compile(
     loss='binary_crossentropy',  # Cambiado a binary_crossentropy
-    optimizer=optimizers[0],  # Usando Adam
+    optimizer=my_optimizers[0],  # Usando Adam
     metrics=METRICS
 )
 
