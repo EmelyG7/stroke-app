@@ -1,218 +1,304 @@
-import tensorflow as tf
-from sklearn.utils import class_weight
-from tensorflow.keras.preprocessing.image import ImageDataGenerator
-from tensorflow.keras.applications import ResNet50
-from tensorflow.keras.models import Model
-from tensorflow.keras.layers import Dense, Flatten, Dropout
-from tensorflow.keras.optimizers import Adam
-from tensorflow.keras.callbacks import ReduceLROnPlateau
-from tensorflow.keras.layers import BatchNormalization
-from tensorflow.keras.callbacks import EarlyStopping
-# Añadir EfficientNet como modelo alternativo para pruebas
-from tensorflow.keras.applications import EfficientNetB0, EfficientNetB3
-from sklearn.metrics import classification_report
-import matplotlib.pyplot as plt
 import os
 import shutil
-from sklearn.model_selection import train_test_split
-from imblearn.over_sampling import RandomOverSampler
+import random
+import logging
+import glob
+from pathlib import Path
+
+import numpy as np
+import pandas as pd
+import seaborn as sns
+import matplotlib.pyplot as plt
+import matplotlib.image as mpimg
+import PIL
+import PIL.Image
+
 import tensorflow as tf
+import tensorflow_datasets as tfds
+from tensorflow import keras
+from tensorflow.keras import backend as K
+from tensorflow.keras import datasets, layers, models, regularizers, optimizers
+from tensorflow.keras.models import Model, Sequential, load_model
+from tensorflow.keras.utils import to_categorical, image_dataset_from_directory
+from tensorflow.keras.preprocessing.image import ImageDataGenerator
+from tensorflow.keras.applications import EfficientNetB4, ResNet50
+from tensorflow.keras.layers import (Conv2D, MaxPooling2D, Flatten, Dense, Dropout, Activation,
+                                     BatchNormalization, GlobalAveragePooling2D)
+from tensorflow.keras.optimizers import Adam
+from tensorflow.keras.callbacks import (ModelCheckpoint, EarlyStopping, ReduceLROnPlateau)
+from tensorflow.keras.metrics import Precision, Recall, RootMeanSquaredError
 
-def focal_loss(alpha, gamma=2):
-    def focal_loss_fixed(y_true, y_pred):
-        y_pred = tf.clip_by_value(y_pred, 1e-7, 1 - 1e-7)
-        cross_entropy = tf.keras.losses.BinaryCrossentropy()(y_true, y_pred)
-        weight = alpha * y_true * (1 - y_pred)**gamma + (1 - alpha) * (1 - y_true) * y_pred**gamma
-        focal_loss = tf.reduce_mean(weight * cross_entropy)
-        return focal_loss
-    return focal_loss_fixed
-# Configuración
-IMG_SIZE = (224, 224)  # Tamaño de las imágenes que usa ResNet-50
-BATCH_SIZE = 16
-EPOCHS = 50
-NUM_CLASSES = 2  # Dos clases: Normal y Stroke
-class_weights = {
-    0: 1.0,  # Normal
-    1: 10.0   # Stroke
-}
+from sklearn.model_selection import (train_test_split, GridSearchCV, cross_val_score, StratifiedKFold, KFold)
+from sklearn.metrics import (classification_report, f1_score, confusion_matrix,
+                             roc_auc_score, accuracy_score)
+from sklearn.preprocessing import label_binarize
+from sklearn.utils import class_weight
+from imblearn.over_sampling import RandomOverSampler
+from scikeras.wrappers import KerasClassifier
 
-# Directorio base
-base_dir = "Brain_Data_Organised/"
-classes = ["Normal", "Stroke"]
+from tqdm import tqdm
 
-# Crear carpetas destino para train y val
-for split in ["train", "val"]:
-    for cls in classes:
-        os.makedirs(os.path.join(base_dir, split, cls), exist_ok=True)
+import keras_tuner as kt
 
-# Por clase, dividir imágenes en train/val
-#Probando el GIT1
-#Probando el GIT222222
-for cls in classes:
-    class_dir = os.path.join(base_dir, cls)
-    images = os.listdir(class_dir)
-    train_images, val_images = train_test_split(images, test_size=0.2, random_state=42)  # 80% train, 20% val
+import gc
 
-    # Copiar imágenes a las respectivas carpetas
-    for img in train_images:
-        shutil.copy(os.path.join(class_dir, img), os.path.join(base_dir, "train", cls, img))
-    for img in val_images:
-        shutil.copy(os.path.join(class_dir, img), os.path.join(base_dir, "val", cls, img))
+# def clean_memory():
+#     gc.collect()
+#     K.clear_session()
+#
+# # Llamar antes de entrenar
+# clean_memory()
 
-# Nota: Tu directorio original queda vacío tras este proceso
+# Disable TensorFlow warnings
+logging.disable(logging.WARNING)
+os.environ["TF_CPP_MIN_LOG_LEVEL"] = "3"
 
-if not os.path.exists(base_dir):
-    raise FileNotFoundError(f"La ruta {base_dir} no existe.")
+print("TensorFlow version:", tf.__version__)
+print("Keras version:", tf.keras.__version__)
 
-train_normal = len(os.listdir("Brain_Data_Organised/train/Normal"))
-train_stroke = len(os.listdir("Brain_Data_Organised/train/Stroke"))
+# Configuraciones globales
+IMG_SIZE = (160, 224)
+TARGET_SIZE = (160, 224, 3)
+BATCH_SIZE = 32
+EPOCHS = 60
+NUM_CLASSES = 2  # Normal y Stroke
+AUTOTUNE = tf.data.AUTOTUNE
 
-val_normal = len(os.listdir("Brain_Data_Organised/val/Normal"))
-val_stroke = len(os.listdir("Brain_Data_Organised/val/Stroke"))
+# Constantes de evaluación y regularización
+LEARNING_RATE = 0.0003
+W_REGULARIZER = 1e-5
+PATIENCE = 7
+FACTOR = 0.3
 
-print(f"Imágenes en 'train/Normal': {train_normal}")
-print(f"Imágenes en 'train/Stroke': {train_stroke}")
-print(f"Imágenes en 'val/Normal': {val_normal}")
-print(f"Imágenes en 'val/Stroke': {val_stroke}")
+# Definir optimizadores
+optimizers = [
+    tf.keras.optimizers.Adam(learning_rate=LEARNING_RATE),
+    tf.keras.optimizers.RMSprop(learning_rate=LEARNING_RATE, rho=0.9, epsilon=1e-08),
+    tf.keras.optimizers.SGD(learning_rate=LEARNING_RATE),
+    tf.keras.optimizers.Adamax(learning_rate=LEARNING_RATE)
+]
 
-# Dividir automáticamente los datos de entrenamiento y validación (entrenamiento: 80%, validación: 20%)
-train_datagen = ImageDataGenerator(
-    rescale=1.0 / 255,  # Normaliza los datos entre 0 y 1
-    rotation_range=45,  # Incrementa la rotación
-    width_shift_range=0.4,  # Permite mayores desplazamientos horizontales
-    height_shift_range=0.4,  # Permite mayores desplazamientos verticales
-    shear_range=0.4,  # Permite un mayor rango de inclinación
-    zoom_range=0.4,  # Aumenta el rango del zoom
-    horizontal_flip=True,
-    fill_mode="nearest"  # Rellena píxeles que falten tras transformaciones
-)
+# Definir métricas
+METRICS = [
+    'accuracy',
+    tf.keras.metrics.Precision(name='precision'),
+    tf.keras.metrics.Recall(name='recall')
+]
 
-val_datagen = ImageDataGenerator(
-    rescale=1.0 / 255,  # Normalizar valores entre 0 y 1
-)
-
-# Generadores de datos para entrenamiento y validación
-train_generator = train_datagen.flow_from_directory(
-    os.path.join(base_dir, "train"),
-    target_size=IMG_SIZE,
-    batch_size=BATCH_SIZE,
-    class_mode="binary",  # Para clasificación binaria
-    shuffle=True  # Mezclar datos
-)
-
-val_generator = val_datagen.flow_from_directory(
-    os.path.join(base_dir, "val"),
-    target_size=IMG_SIZE,
-    batch_size=BATCH_SIZE,
-    class_mode="binary",  # Para clasificación binaria
-    shuffle=False  # Sin mezclar para que las predicciones sean consistentes
-)
-
-print("Distribución de entrenamiento:")
-for cls in classes:
-    print(f"{cls}: {len(os.listdir(os.path.join(base_dir, 'train', cls)))} imágenes")
-
-print("\nDistribución de validación:")
-for cls in classes:
-    print(f"{cls}: {len(os.listdir(os.path.join(base_dir, 'val', cls)))} imágenes")
-
-# Cargar el modelo base ResNet-50 y EfficientNetB0 preentrenado en ImageNet
-use_efficientnet = True  # Cambiar a True para probar EfficientNetB0
-base_model = EfficientNetB3(weights="imagenet", include_top=False, input_shape=(IMG_SIZE[0], IMG_SIZE[1], 3))
-
-# Congelar las capas base (para transfer learning)
-# Ajustar capas base para fine-tuning avanzado
-base_model.trainable = True
-fine_tune_at = int(len(base_model.layers) * 0.7)  # Descongelar parcialmente el 30%
-for layer in base_model.layers[:fine_tune_at]:
-    layer.trainable = False
-# Añadir capas personalizadas en la parte superior
-x = Flatten()(base_model.output)
-x = Dense(256, activation="relu")(x)  # Incrementa la capacidad de esta capa
-x = BatchNormalization()(x)  # Capa de normalización
-x = Dropout(0.5)(x)  # Dropout para evitar sobreajuste
-x = Dense(128, activation="relu")(x)  # Añade otra capa completamente conectada
-x = BatchNormalization()(x)  # Capa de normalización
-x = Dropout(0.5)(x)
-output = Dense(1, activation="sigmoid")(x)
-
-# Crear el modelo completo
-model = Model(inputs=base_model.input, outputs=output)
-
-# Compilar el modelo
-model.compile(
-    optimizer=Adam(learning_rate=0.0001),
-    loss=focal_loss(alpha=0.75, gamma=2.0),
-    metrics=["accuracy", "Precision", "Recall"]
-)
-# Preparar ajuste fino después de algunas épocas (descomentar cuando sea necesario)
-def fine_tune_model():
-    for layer in base_model.layers[-20:]:  # Ajustar solo últimas 20 capas
-        layer.trainable = True
-
-
-# Callback para reducir la tasa de aprendizaje si no mejora
-reduce_lr = ReduceLROnPlateau(
-    monitor="val_loss",
-    factor=0.5,
-    patience=3,
-    min_lr=1e-6,
+# Callbacks
+reduce_lr_on_plateau = tf.keras.callbacks.ReduceLROnPlateau(
+    monitor='val_accuracy',
+    factor=FACTOR,
+    patience=PATIENCE,
+    min_lr=W_REGULARIZER,
     verbose=1
 )
 
-early_stopping = EarlyStopping(
-    monitor="val_loss",
-    patience=5,  # Número de épocas sin mejora antes de detener
-    restore_best_weights=True  # Restaurar el modelo con los mejores pesos
+early_stopping = tf.keras.callbacks.EarlyStopping(
+    monitor='accuracy',
+    patience=10,
+    restore_best_weights=True
 )
 
-# Actualizar los callbacks
-callbacks = [reduce_lr, early_stopping]
+# Capas de preprocesamiento
+resize_and_rescale = tf.keras.Sequential([
+    layers.Rescaling(1./255),
+    layers.Resizing(IMG_SIZE[0], IMG_SIZE[1])
+])
 
-# Entrenar con los nuevos callbacks
+data_augmentation = tf.keras.Sequential([
+    layers.RandomFlip("horizontal_and_vertical"),
+    layers.RandomRotation(0.8),
+    layers.RandomTranslation(height_factor=0.05, width_factor=0.05),
+    layers.RandomZoom(0.3)
+])
+
+base_dir = "Dataset/"
+batch_size = 32
+train_ds = tf.keras.utils.image_dataset_from_directory(
+    os.path.join(base_dir, "train"),
+    labels='inferred',
+    label_mode='binary',
+    shuffle=True,
+    seed=123,
+    batch_size=BATCH_SIZE,
+    image_size=IMG_SIZE
+)
+
+val_ds = tf.keras.utils.image_dataset_from_directory(
+    os.path.join(base_dir, "val"),
+    labels='inferred',
+    label_mode='binary',
+    shuffle=False,
+    batch_size=batch_size
+)
+
+test_ds = tf.keras.utils.image_dataset_from_directory(
+    os.path.join(base_dir, "test"),
+    labels='inferred',
+    label_mode='binary',
+    shuffle=False,
+    batch_size=batch_size
+)
+
+print(len(train_ds))
+
+class_names = train_ds.class_names
+print(class_names)
+
+# Opcional: Verificación de los tamaños de los subconjuntos
+# Conteo de imágenes
+train_normal = len(os.listdir(os.path.join(base_dir, "train", "Normal")))
+train_stroke = len(os.listdir(os.path.join(base_dir, "train", "Stroke")))
+val_normal = len(os.listdir(os.path.join(base_dir, "val", "Normal")))
+val_stroke = len(os.listdir(os.path.join(base_dir, "val", "Stroke")))
+test_normal = len(os.listdir(os.path.join(base_dir, "test", "Normal")))
+test_stroke = len(os.listdir(os.path.join(base_dir, "test", "Stroke")))
+
+
+print(f"Tamaño del conjunto de entrenamiento 'train/Normal': {train_normal}")
+print(f"Tamaño del conjunto de entrenamiento 'train/Stroke': {train_stroke}")
+print(f"Tamaño del conjunto de validación 'val/Normal': {val_normal}")
+print(f"Tamaño del conjunto de validación 'val/Stroke': {val_stroke}")
+print(f"Tamaño del conjunto de prueba 'test/Normal': {test_normal}")
+print(f"Tamaño del conjunto de prueba 'test/Stroke': {test_stroke}")
+
+train_dataset = train_ds.cache().prefetch(buffer_size=AUTOTUNE)
+val_dataset = val_ds.cache().prefetch(buffer_size=AUTOTUNE)
+test_dataset = test_ds.cache().prefetch(buffer_size=AUTOTUNE)
+
+images_total, labels_total = next(iter(train_ds))
+print('Batch shape: ', images_total.shape)
+print('Label shape: ', labels_total.shape)
+
+images, labels = next(iter(train_dataset))
+print('Batch shape: ', images.shape)
+print('Label shape: ', labels.shape)
+
+image_val,labels_val = next(iter(val_dataset))
+print('Batch shape: ', image_val.shape)
+print('Label shape: ', labels_val.shape)
+
+# plt.figure(figsize=(10, 10))
+# for images, labels in train_ds.take(5):
+#   for i in range(9):
+#     ax = plt.subplot(3, 3, i + 1)
+#     plt.imshow(images[i].numpy().astype("uint8"))
+#     plt.axis("off")
+#
+# plt.figure(figsize=(10, 10))
+# for images, _ in train_ds.take(1):
+#   for i in range(9):
+#     resized = resize_and_rescale(images)
+#     augmented_images = data_augmentation(resized)
+#     ax = plt.subplot(3, 3, i + 1)
+#     plt.imshow(augmented_images[0])
+#     plt.axis("off")
+
+
+model = models.Sequential([
+    resize_and_rescale,
+    data_augmentation,
+    layers.Conv2D(16, (3, 3), activation='relu', padding='same', input_shape=TARGET_SIZE),
+    layers.MaxPooling2D((2, 2)),
+    layers.Conv2D(32, (3, 3), activation='relu', padding='same'),
+    layers.MaxPooling2D((2, 2)),
+    layers.Conv2D(64, (3, 3), activation='relu', padding='same'),
+    layers.MaxPooling2D((2, 2)),
+    layers.Flatten(),
+    layers.Dense(64, activation='relu'),
+    layers.Dense(1, activation='sigmoid')
+])
+
+#build and summary layers
+# model.build(input_shape=input_shape)
+model.summary()
+
+
+
+model.compile(
+    loss='binary_crossentropy',  # Cambiado a binary_crossentropy
+    optimizer=optimizers[0],  # Usando Adam
+    metrics=METRICS
+)
+
+# Entrenar el modelo
 history = model.fit(
-    train_generator,
+    train_dataset,
+    validation_data=val_dataset,
     epochs=EPOCHS,
-    validation_data=val_generator,
-    class_weight=class_weights,
-    callbacks=callbacks,
-    steps_per_epoch=train_generator.samples // BATCH_SIZE
+    batch_size=BATCH_SIZE,
+    callbacks=[reduce_lr_on_plateau, early_stopping],
+    verbose=1
 )
 
-# Evaluar el modelo
-results = model.evaluate(val_generator)
-loss, accuracy, precision, recall = results  # Ajustar para capturar todas las métricas devueltas
-print(f"Pérdida en validación: {loss}")
-print(f"Precisión en validación: {accuracy}")
-print(f"Exactitud en validación (precision): {precision}")
-print(f"Sensibilidad en validación (recall): {recall}")
+metrics = model.evaluate(test_dataset, verbose=2)
 
-# Predicciones
-y_true = val_generator.classes
-y_pred = model.predict(val_generator)
-y_pred_classes = y_pred > 0.5
+precision = metrics[2]
+recall = metrics[3]
+accuracy = metrics[1]
+loss = metrics[0]
+RMSE = metrics[4]
+f1_score = 2 * (precision * recall) / (precision + recall + tf.keras.backend.epsilon())
 
-print(classification_report(y_true, y_pred_classes, target_names=list(val_generator.class_indices.keys())))
+print(f'Exactitud: {accuracy}')
+print(f'Precision: {precision}')
+print(f'Recall: {recall}')
+print(f'Loss: {loss}')
+print(f'f1_score: {f1_score}')
 
-plt.figure(figsize=(12, 6))
-plt.subplot(1, 2, 1)
-plt.plot(history.history['accuracy'], label='Accuracy entrenamiento')
-plt.plot(history.history['val_accuracy'], label='Accuracy validación')
-plt.xlabel('Épocas')
-plt.ylabel('Precisión')
+plt.plot(history.history['accuracy'], label='Train')
+plt.plot(history.history['val_accuracy'], label = 'Val')
+plt.xlabel('Epoch')
+plt.ylabel('Accuracy')
+#plt.ylim([0.5, 1])
 plt.legend(loc='lower right')
-
-plt.subplot(1, 2, 2)
-plt.plot(history.history['loss'], label='Loss entrenamiento')
-plt.plot(history.history['val_loss'], label='Loss validación')
-plt.xlabel('Épocas')
-plt.ylabel('Pérdida')
-plt.legend(loc='upper right')
-
-plt.tight_layout()
 plt.show()
 
+plt.plot(history.history['loss'], label='Train')
+plt.plot(history.history['val_loss'], label = 'Val')
+plt.xlabel('Epoch')
+plt.ylabel('Loss')
+#plt.ylim([0.5, 1])
+plt.legend(loc='lower right')
+plt.show()
+
+y_pred = model.predict(test_dataset)
+y_true = np.concatenate([y for x, y in test_dataset], axis=0)
+print(len(y_true))
+print(len(y_pred))
+rounded_pred = np.round(y_pred).astype(int)  # Para clasificación binaria
+print(y_pred)
+
+print(classification_report(y_true, rounded_pred, target_names=class_names))
+
+# Generar la matriz de confusión
+cf_matrix = confusion_matrix(y_true, rounded_pred)
+
+plt.figure(figsize=(8, 6))
+plt.imshow(cf_matrix, interpolation='nearest', cmap='Blues')
+plt.title('Confusion Matrix')
+plt.colorbar()
+tick_marks = np.arange(len(class_names))
+plt.xticks(tick_marks, class_names, rotation=45)
+plt.yticks(tick_marks, class_names)
+plt.ylabel('True Label')
+plt.xlabel('Predicted Label')
+
+# Anotar los valores en la matriz de confusión
+for i in range(len(class_names)):
+    for j in range(len(class_names)):
+        plt.text(j, i, str(cf_matrix[i, j]), horizontalalignment='center', verticalalignment='center', color='black')
+
+plt.show()
+
+# Liberar memoria GPU si estás usando una
+import tensorflow as tf
+gpus = tf.config.experimental.list_physical_devices('GPU')
+if gpus:
+    tf.config.experimental.set_virtual_device_configuration(
+        gpus[0],
+        [tf.config.experimental.VirtualDeviceConfiguration(memory_limit=4096)]
+    )
 
 
-# Guardar el modelo entrenado
-model.save("modelo_resnet50_brain_data.h5")
