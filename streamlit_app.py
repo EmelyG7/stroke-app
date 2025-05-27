@@ -90,7 +90,7 @@ class F1Score(tf.keras.metrics.Metric):
 @st.cache_resource
 def load_custom_model():
     try:
-        model_path = "/best_densenet121_fold_5.keras"
+        model_path = "best_densenet121_fold_5.keras"
         model = load_model(model_path, custom_objects={'F1Score': F1Score})
         return model
     except Exception as e:
