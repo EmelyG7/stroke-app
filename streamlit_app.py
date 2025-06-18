@@ -17,6 +17,8 @@ from gridfs import GridFS
 from pymongo import MongoClient
 from bson.objectid import ObjectId
 import tempfile
+import calendar
+from datetime import datetime as dt
 
 # Configuración de Streamlit
 st.set_page_config(page_title="Stroke Management App", page_icon="🏥", layout="wide")
@@ -35,6 +37,8 @@ def init_mongodb():
             db.create_collection('patients')
         if 'consultations' not in db.list_collection_names():
             db.create_collection('consultations')
+        if 'stats' not in db.list_collection_names():
+            db.create_collection('stats')
 
         fs = GridFS(db)
         return db, fs
@@ -164,13 +168,19 @@ def get_image_from_mongodb(image_id):
         return None
 
 
-def add_patient(name, age, gender):
+def add_patient(name, age, gender, smoker=False, alcoholic=False, hypertension=False, diabetes=False,
+                heart_disease=False):
     try:
         patient = {
             "name": name,
             "age": age,
             "gender": gender,
-            "created_at": datetime.datetime.now()
+            "smoker": smoker,
+            "alcoholic": alcoholic,
+            "hypertension": hypertension,
+            "diabetes": diabetes,
+            "heart_disease": heart_disease,
+            "created_at": dt.now()
         }
         result = db.patients.insert_one(patient)
         return result.inserted_id
@@ -188,22 +198,59 @@ def get_patients():
         return []
 
 
-def add_consultation(patient_id, date, notes):
+def add_consultation(patient_id, date, notes, diagnosis=None, probability=None):
     try:
         if isinstance(date, datetime.date):
-            date = datetime.datetime.combine(date, datetime.datetime.min.time())
+            date = dt.combine(date, dt.min.time())
 
         consultation = {
             "patient_id": patient_id,
             "date": date,
             "notes": notes,
-            "created_at": datetime.datetime.now()
+            "diagnosis": diagnosis,
+            "probability": probability,
+            "created_at": dt.now()
         }
         result = db.consultations.insert_one(consultation)
+
+        # Actualizar estadísticas si es un stroke
+        if diagnosis == "Stroke":
+            update_monthly_stats(date, probability)
+
         return result.inserted_id
     except Exception as e:
         st.error(f"Error al agregar consulta: {e}")
         return None
+
+
+def update_monthly_stats(date, probability):
+    try:
+        year_month = date.strftime("%Y-%m")
+
+        db.stats.update_one(
+            {"year_month": year_month},
+            {"$inc": {"stroke_count": 1}, "$push": {"probabilities": probability}},
+            upsert=True
+        )
+    except Exception as e:
+        st.error(f"Error al actualizar estadísticas: {e}")
+
+
+def get_monthly_stats():
+    try:
+        pipeline = [
+            {"$sort": {"year_month": 1}},
+            {"$project": {
+                "year_month": 1,
+                "stroke_count": 1,
+                "avg_probability": {"$avg": "$probabilities"}
+            }}
+        ]
+        stats = list(db.stats.aggregate(pipeline))
+        return stats
+    except Exception as e:
+        st.error(f"Error al obtener estadísticas: {e}")
+        return []
 
 
 def get_consultations():
@@ -227,6 +274,8 @@ def get_consultations():
                     "patient_name": "$patient.name",
                     "date": 1,
                     "notes": 1,
+                    "diagnosis": 1,
+                    "probability": 1,
                     "created_at": 1
                 }
             }
@@ -256,7 +305,7 @@ def add_image_analysis(consultation_id, image_id, diagnosis, confidence, probabi
             "diagnosis": diagnosis,
             "confidence": confidence,
             "probability": probability,
-            "created_at": datetime.datetime.now()
+            "created_at": dt.now()
         }
         result = db.image_analyses.insert_one(analysis)
         return result.inserted_id
@@ -303,7 +352,7 @@ def get_images_by_consultation(consultation_id):
 # --------------------------
 # Generación de Reportes
 # --------------------------
-def create_pdf_report(consultation_id, patient_name, date, notes, images_data):
+def create_pdf_report(consultation_id, patient_name, date, notes, images_data, patient_data=None):
     pdf = FPDF()
     pdf.add_page()
     pdf.set_font("Arial", "B", 16)
@@ -313,6 +362,30 @@ def create_pdf_report(consultation_id, patient_name, date, notes, images_data):
     pdf.cell(200, 10, txt=f"Paciente: {patient_name}", ln=1)
     pdf.cell(200, 10, txt=f"Fecha: {date.strftime('%Y-%m-%d')}", ln=1)
     pdf.cell(200, 10, txt=f"ID de Consulta: {consultation_id}", ln=1)
+
+    # Add patient medical history if available
+    if patient_data:
+        pdf.ln(5)
+        pdf.set_font("Arial", "B", 12)
+        pdf.cell(200, 10, txt="Antecedentes Médicos:", ln=1)
+        pdf.set_font("Arial", size=12)
+
+        # Create medical history string
+        medical_history = []
+        if patient_data.get("hypertension", False):
+            medical_history.append("Hipertensión")
+        if patient_data.get("diabetes", False):
+            medical_history.append("Diabetes")
+        if patient_data.get("heart_disease", False):
+            medical_history.append("Enfermedad cardíaca")
+        if patient_data.get("smoker", False):
+            medical_history.append("Fumador")
+        if patient_data.get("alcoholic", False):
+            medical_history.append("Consumo de alcohol")
+
+        history_text = ", ".join(medical_history) if medical_history else "Ninguno registrado"
+        pdf.cell(200, 10, txt=history_text, ln=1)
+
     pdf.ln(5)
     pdf.set_font("Arial", "B", 12)
     pdf.cell(200, 10, txt="Notas Médicas:", ln=1)
@@ -341,7 +414,7 @@ def create_pdf_report(consultation_id, patient_name, date, notes, images_data):
         ax.set_title('Probabilidades por Imagen')
 
         img_buf = BytesIO()
-        plt.savefig(img_buf, format='png', bbox_inches='tight')
+        plt.savefig(img_buf, format='png', bbox_inches='tight', dpi=150)
         plt.close()
 
         temp_dir = tempfile.mkdtemp()
@@ -385,15 +458,34 @@ def patient_management():
     st.header("Gestión de Pacientes")
 
     with st.form("patient_form"):
-        name = st.text_input("Nombre del Paciente")
-        age = st.number_input("Edad", min_value=0, max_value=120, step=1)
-        gender = st.selectbox("Género", ["Masculino", "Femenino", "Otro"])
+        col1, col2 = st.columns(2)
+        with col1:
+            name = st.text_input("Nombre del Paciente*")
+            age = st.number_input("Edad*", min_value=0, max_value=120, step=1)
+            gender = st.selectbox("Género*", ["Masculino", "Femenino", "Otro"])
+
+        with col2:
+            st.markdown("**Antecedentes Médicos**")
+            smoker = st.checkbox("Fumador")
+            alcoholic = st.checkbox("Consume alcohol")
+            hypertension = st.checkbox("Hipertensión")
+            diabetes = st.checkbox("Diabetes")
+            heart_disease = st.checkbox("Enfermedad cardíaca")
+
         submitted = st.form_submit_button("Agregar Paciente")
 
-        if submitted and name and age and gender:
-            patient_id = add_patient(name, age, gender)
-            if patient_id:
-                st.success("Paciente agregado exitosamente")
+        if submitted:
+            if not name or not age or not gender:
+                st.error("Por favor complete los campos obligatorios (*)")
+            else:
+                patient_id = add_patient(
+                    name, age, gender,
+                    smoker, alcoholic,
+                    hypertension, diabetes,
+                    heart_disease
+                )
+                if patient_id:
+                    st.success("Paciente agregado exitosamente")
 
     st.subheader("Lista de Pacientes")
     patients = get_patients()
@@ -403,120 +495,166 @@ def patient_management():
             "Nombre": p["name"],
             "Edad": p["age"],
             "Género": p["gender"],
+            "Fumador": "Sí" if p.get("smoker", False) else "No",
+            "Alcohol": "Sí" if p.get("alcoholic", False) else "No",
+            "Hipertensión": "Sí" if p.get("hypertension", False) else "No",
+            "Diabetes": "Sí" if p.get("diabetes", False) else "No",
+            "Cardíaco": "Sí" if p.get("heart_disease", False) else "No",
             "Fecha Registro": p["created_at"].strftime("%Y-%m-%d %H:%M")
         } for p in patients])
         st.dataframe(df, use_container_width=True)
 
 
-def consultation_management():
-    st.header("Gestión de Consultas")
+def register_consultation():
+    st.header("Registrar Nueva Consulta")
 
-    # Sección para registrar nueva consulta
-    st.subheader("Registrar Nueva Consulta")
     patients = get_patients()
     patient_options = {p["name"]: p["_id"] for p in patients}
 
     with st.form("consultation_form"):
-        patient_name = st.selectbox("Paciente", list(patient_options.keys()))
-        date = st.date_input("Fecha")
+        patient_name = st.selectbox("Paciente*", list(patient_options.keys()))
+        date = st.date_input("Fecha*", value=dt.now())
         notes = st.text_area("Notas Médicas")
-        uploaded_files = st.file_uploader("Subir Imágenes DWI", type=["jpg", "jpeg", "png"], accept_multiple_files=True)
+        uploaded_files = st.file_uploader("Subir Imágenes DWI*", type=["jpg", "jpeg", "png"],
+                                          accept_multiple_files=True)
+
         submitted = st.form_submit_button("Registrar Consulta")
 
-        if submitted and patient_name and date and uploaded_files:
-            patient_id = patient_options[patient_name]
-            consultation_id = add_consultation(patient_id, date, notes)
+        if submitted:
+            if not patient_name or not date or not uploaded_files:
+                st.error("Por favor complete los campos obligatorios (*)")
+            else:
+                patient_id = patient_options[patient_name]
+                patient_data = next((p for p in patients if p["_id"] == patient_id), None)
 
-            if consultation_id:
-                st.success("Consulta registrada exitosamente")
-
+                # Procesar imágenes primero para obtener diagnóstico
                 images_data = []
                 for uploaded_file in uploaded_files:
-                    image_id = save_image_to_mongodb(uploaded_file, uploaded_file.name)
+                    image = Image.open(uploaded_file)
+                    predicted_class, confidence, probability, display_img = predict_image(image)
 
-                    if image_id:
-                        image = Image.open(uploaded_file)
-                        predicted_class, confidence, probability, display_img = predict_image(image)
+                    images_data.append({
+                        "predicted_class": predicted_class,
+                        "probability": probability,
+                        "confidence": confidence
+                    })
 
-                        analysis_id = add_image_analysis(
-                            consultation_id,
-                            image_id,
-                            predicted_class,
-                            confidence,
-                            probability
-                        )
+                # Calcular diagnóstico general
+                probabilities = [data['probability'] for data in images_data]
+                avg_probability = np.mean(probabilities)
+                final_diagnosis = "Stroke" if avg_probability >= 0.5 else "Normal"
 
-                        if analysis_id:
-                            images_data.append({
-                                "image_id": image_id,
-                                "diagnosis": predicted_class,
-                                "confidence": confidence,
-                                "probability": probability,
-                                "filename": uploaded_file.name,
-                                "display_img": display_img
-                            })
+                # Registrar consulta
+                consultation_id = add_consultation(
+                    patient_id,
+                    date,
+                    notes,
+                    final_diagnosis,
+                    avg_probability
+                )
 
-                if images_data:
-                    st.subheader("Resultados de la Consulta")
+                if consultation_id:
+                    st.success("Consulta registrada exitosamente")
 
-                    probabilities = [data['probability'] for data in images_data]
-                    avg_probability = np.mean(probabilities)
-                    final_diagnosis = "Stroke" if avg_probability >= 0.5 else "Normal"
+                    # Guardar imágenes y análisis
+                    for i, (uploaded_file, data) in enumerate(zip(uploaded_files, images_data)):
+                        uploaded_file.seek(0)  # Rewind the file
+                        image_id = save_image_to_mongodb(uploaded_file, uploaded_file.name)
 
+                        if image_id:
+                            analysis_id = add_image_analysis(
+                                consultation_id,
+                                image_id,
+                                data["predicted_class"],
+                                data["confidence"],
+                                data["probability"]
+                            )
+
+                    # Mostrar resumen
+                    st.subheader("Resumen de la Consulta")
                     col1, col2 = st.columns(2)
                     with col1:
-                        st.metric("Diagnóstico Promedio", final_diagnosis)
+                        st.metric("Diagnóstico Final", final_diagnosis)
                         st.metric("Probabilidad Promedio", f"{avg_probability * 100:.2f}%")
                     with col2:
-                        st.metric("Mínima Probabilidad", f"{min(probabilities) * 100:.2f}%")
-                        st.metric("Máxima Probabilidad", f"{max(probabilities) * 100:.2f}%")
+                        st.metric("Número de Imágenes", len(uploaded_files))
+                        st.metric("Rango de Probabilidades",
+                                  f"{min(probabilities) * 100:.2f}% - {max(probabilities) * 100:.2f}%")
 
-                    fig, ax = plt.subplots()
-                    ax.bar(range(len(probabilities)), [p * 100 for p in probabilities])
-                    ax.set_ylim(0, 100)
-                    ax.set_ylabel('Probabilidad de Stroke (%)')
-                    ax.set_title('Probabilidades por Imagen')
-                    st.pyplot(fig)
+                    # Generate PDF in memory
+                    pdf = create_pdf_report(
+                        str(consultation_id),
+                        patient_name,
+                        date,
+                        notes,
+                        [{
+                            "image_path": "",
+                            "diagnosis": data["predicted_class"],
+                            "confidence": data["confidence"],
+                            "probability": data["probability"]
+                        } for data in images_data],
+                        patient_data  # Pass patient data to include medical history
+                    )
 
-                    st.subheader("Análisis Individual por Imagen")
-                    for i, data in enumerate(images_data, 1):
-                        st.markdown(f"**Imagen {i}: {data['filename']}**")
+                    # Create a temporary file for the PDF
+                    with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as tmp:
+                        pdf_output = tmp.name
+                        pdf.output(pdf_output)
 
-                        col1, col2 = st.columns(2)
-                        with col1:
-                            if data['display_img'] is not None:
-                                st.image(data['display_img'], caption=f"Diagnóstico: {data['diagnosis']}")
-
-                        with col2:
-                            st.metric("Resultado", data['diagnosis'])
-                            st.metric("Confianza", f"{data['confidence'] * 100:.2f}%")
-                            st.metric("Probabilidad Stroke", f"{data['probability'] * 100:.2f}%")
-                            st.progress(data['probability'])
-
-                        st.markdown("---")
-
-                    # Generar PDF inmediatamente después de registrar la consulta
-                    temp_dir = tempfile.mkdtemp()
-                    pdf = create_pdf_report(str(consultation_id), patient_name, date, notes, images_data)
-                    pdf_output = os.path.join(temp_dir, f"consulta_{consultation_id}.pdf")
-                    pdf.output(pdf_output)
-
+                    # Create download button
                     with open(pdf_output, "rb") as f:
-                        st.download_button(
-                            label="Descargar Informe de Consulta",
-                            data=f.read(),
-                            file_name=f"consulta_{patient_name.replace(' ', '_')}_{date.strftime('%Y%m%d')}.pdf",
-                            mime="application/pdf"
-                        )
+                        pdf_bytes = f.read()
 
-    # Sección para ver consultas anteriores
-    st.subheader("Consultas Registradas")
+                    # Remove temporary file
+                    try:
+                        os.unlink(pdf_output)
+                    except:
+                        pass
+
+                    st.download_button(
+                        label="Descargar Informe de Consulta",
+                        data=pdf_bytes,
+                        file_name=f"consulta_{patient_name.replace(' ', '_')}_{date.strftime('%Y%m%d')}.pdf",
+                        mime="application/pdf"
+                    )
+
+
+def view_consultations():
+    st.header("Consultas Registradas")
+
+    # Estadísticas mensuales
+    st.subheader("Estadísticas de Strokes por Mes")
+    monthly_stats = get_monthly_stats()
+
+    if monthly_stats:
+        stats_df = pd.DataFrame([{
+            "Mes/Año": s["year_month"],
+            "N° Strokes": s["stroke_count"],
+            "Probabilidad Promedio": f"{s.get('avg_probability', 0) * 100:.2f}%"
+        } for s in monthly_stats])
+
+        st.dataframe(stats_df, use_container_width=True)
+
+        # Gráfico de barras
+        fig, ax = plt.subplots(figsize=(10, 4))
+        ax.bar(stats_df["Mes/Año"], stats_df["N° Strokes"])
+        ax.set_title("Casos de Stroke por Mes")
+        ax.set_ylabel("Número de Casos")
+        ax.set_xlabel("Mes/Año")
+        plt.xticks(rotation=45)
+        st.pyplot(fig)
+    else:
+        st.info("No hay estadísticas disponibles aún")
+
+    # Lista de consultas
+    st.subheader("Historial de Consultas")
     consultations = get_consultations()
 
     if consultations:
-        # Crear lista de consultas para el selectbox con formato: "Paciente - Consulta #N"
+        # Crear lista de consultas para el selectbox con formato: "Paciente - Consulta #N - Fecha"
         consultation_options = {
-            f"{c['patient_name']} - Consulta #{c['consultation_number']}": str(c["consultation_id"])
+            f"{c['patient_name']} - Consulta #{c['consultation_number']} - {c['date'].strftime('%Y-%m-%d')}": str(
+                c["consultation_id"])
             for c in consultations
         }
 
@@ -533,26 +671,41 @@ def consultation_management():
             )
 
             if consultation_data:
-                st.markdown(f"**Paciente:** {consultation_data['patient_name']}")
-                st.markdown(f"**Fecha:** {consultation_data['date'].strftime('%Y-%m-%d')}")
+                st.markdown("---")
+                st.subheader("Detalles de la Consulta")
+
+                col1, col2 = st.columns(2)
+                with col1:
+                    st.markdown(f"**Paciente:** {consultation_data['patient_name']}")
+                    st.markdown(f"**Fecha:** {consultation_data['date'].strftime('%Y-%m-%d')}")
+                with col2:
+                    st.markdown(f"**Diagnóstico:** {consultation_data.get('diagnosis', 'No registrado')}")
+                    if consultation_data.get('probability'):
+                        st.markdown(f"**Probabilidad:** {consultation_data['probability'] * 100:.2f}%")
+
                 st.markdown(f"**Notas:** {consultation_data['notes']}")
 
+                # Obtener datos del paciente para antecedentes médicos
+                patient_data = db.patients.find_one({"_id": consultation_data["patient_id"]})
+
+                # Mostrar antecedentes médicos
+                if patient_data:
+                    st.subheader("Antecedentes Médicos del Paciente")
+                    cols = st.columns(4)
+                    with cols[0]:
+                        st.metric("Hipertensión", "Sí" if patient_data.get("hypertension", False) else "No")
+                    with cols[1]:
+                        st.metric("Diabetes", "Sí" if patient_data.get("diabetes", False) else "No")
+                    with cols[2]:
+                        st.metric("Enf. Cardíaca", "Sí" if patient_data.get("heart_disease", False) else "No")
+                    with cols[3]:
+                        st.metric("Fumador", "Sí" if patient_data.get("smoker", False) else "No")
+
+                # Mostrar imágenes de la consulta
                 images = get_images_by_consultation(ObjectId(selected_consultation_id))
 
                 if images:
                     st.subheader("Imágenes de la Consulta")
-
-                    probabilities = [img['probability'] for img in images]
-                    avg_probability = np.mean(probabilities)
-
-                    col1, col2 = st.columns(2)
-                    with col1:
-                        st.metric("Diagnóstico Promedio", "Stroke" if avg_probability >= 0.5 else "Normal")
-                        st.metric("Probabilidad Promedio", f"{avg_probability * 100:.2f}%")
-                    with col2:
-                        st.metric("Número de Imágenes", len(images))
-                        st.metric("Rango de Probabilidades",
-                                  f"{min(probabilities) * 100:.2f}% - {max(probabilities) * 100:.2f}%")
 
                     for img in images:
                         st.markdown(f"**{img['filename']}**")
@@ -571,7 +724,7 @@ def consultation_management():
 
                         st.markdown("---")
 
-                    # Botón para generar PDF de la consulta seleccionada
+                    # Botón para generar PDF
                     images_data_for_pdf = [{
                         "image_path": "",
                         "diagnosis": img['diagnosis'],
@@ -579,24 +732,41 @@ def consultation_management():
                         "probability": img['probability']
                     } for img in images]
 
-                    temp_dir = tempfile.mkdtemp()
+                    # Generate PDF in memory
                     pdf = create_pdf_report(
                         selected_consultation_id,
                         consultation_data['patient_name'],
                         consultation_data['date'],
                         consultation_data['notes'],
-                        images_data_for_pdf
+                        images_data_for_pdf,
+                        patient_data  # Include patient medical history
                     )
-                    pdf_output = os.path.join(temp_dir, f"consulta_{selected_consultation_id}.pdf")
-                    pdf.output(pdf_output)
 
+                    # Create a temporary file for the PDF
+                    with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as tmp:
+                        pdf_output = tmp.name
+                        pdf.output(pdf_output)
+
+                    # Create download button
                     with open(pdf_output, "rb") as f:
-                        st.download_button(
-                            label="Generar Informe PDF de esta Consulta",
-                            data=f.read(),
-                            file_name=f"consulta_{consultation_data['patient_name'].replace(' ', '_')}_{consultation_data['date'].strftime('%Y%m%d')}.pdf",
-                            mime="application/pdf"
-                        )
+                        pdf_bytes = f.read()
+
+                    # Remove temporary file
+                    try:
+                        os.unlink(pdf_output)
+                    except:
+                        pass
+
+                    st.download_button(
+                        label="Generar Informe PDF de esta Consulta",
+                        data=pdf_bytes,
+                        file_name=f"consulta_{consultation_data['patient_name'].replace(' ', '_')}_{consultation_data['date'].strftime('%Y%m%d')}.pdf",
+                        mime="application/pdf"
+                    )
+                else:
+                    st.info("Esta consulta no tiene imágenes asociadas")
+    else:
+        st.info("No hay consultas registradas aún")
 
 
 # --------------------------
@@ -604,14 +774,20 @@ def consultation_management():
 # --------------------------
 def main():
     st.title("🏥 Sistema de Gestión para Detección de Stroke")
-    st.markdown("Gestión de pacientes y consultas con análisis de imágenes DWI")
+    st.markdown("Gestión de pacientes, consultas y análisis de imágenes DWI")
 
-    menu = st.sidebar.selectbox("Menú", ["Gestión de Pacientes", "Gestión de Consultas"])
+    menu = st.sidebar.selectbox("Menú", [
+        "Gestión de Pacientes",
+        "Registrar Consulta",
+        "Ver Consultas y Estadísticas"
+    ])
 
     if menu == "Gestión de Pacientes":
         patient_management()
-    elif menu == "Gestión de Consultas":
-        consultation_management()
+    elif menu == "Registrar Consulta":
+        register_consultation()
+    elif menu == "Ver Consultas y Estadísticas":
+        view_consultations()
 
 
 if __name__ == "__main__":
