@@ -12,17 +12,23 @@ import datetime
 import os
 import matplotlib.pyplot as plt
 from io import BytesIO
+from werkzeug.security import check_password_hash
+from werkzeug.security import generate_password_hash
 import pymongo
 from gridfs import GridFS
 from pymongo import MongoClient
 from bson.objectid import ObjectId
+
 import tempfile
 import calendar
 from datetime import datetime as dt
+from streamlit.runtime.scriptrunner import RerunException
+
 
 # Configuración de Streamlit
 st.set_page_config(page_title="Stroke Management App", page_icon="🏥", layout="wide")
 
+st.write("Streamlit version:", st.__version__)
 
 # --------------------------
 # Configuración de MongoDB
@@ -52,6 +58,45 @@ db, fs = init_mongodb()
 if db is None or fs is None:
     st.error("No se pudo conectar a MongoDB. Verifique la cadena de conexión.")
     st.stop()
+
+#Funciones de acceso a doctores
+def get_doctor(username: str):
+    return db.doctors.find_one({"username": username})
+
+def authenticate_doctor(username: str, password: str):
+    doc = get_doctor(username)
+    if doc and check_password_hash(doc["password_hash"], password):
+        return doc
+    return None
+
+def login_page():
+    st.title("🔐 Login")
+    with st.form("login_form"):
+        user = st.text_input("Usuario")
+        pwd  = st.text_input("Contraseña", type="password")
+        ok   = st.form_submit_button("Ingresar")
+
+    if ok:
+        doctor = authenticate_doctor(user, pwd)
+        if doctor:
+            st.session_state["user"] = {
+                "username":  doctor["username"],
+                "full_name": doctor["full_name"],
+                "role":      doctor["role"]
+            }
+            st.success("¡Bienvenido, " + doctor["full_name"] + "!")
+           #st.experimental_rerun()   
+        else:
+            st.error("Usuario o contraseña inválidos")
+
+
+
+def logout():
+    if "user" in st.session_state:
+        del st.session_state["user"]
+    #st.experimental_rerun()
+
+
 
 
 # --------------------------
@@ -772,17 +817,145 @@ def view_consultations():
 # --------------------------
 # Aplicación Principal
 # --------------------------
+# --------------------------
+# Aplicación Principal
+# --------------------------
+
+def manage_users():
+    st.header("🔧 Gestión de Usuarios")
+    # 1) Listado de usuarios existentes
+    docs = list(db.doctors.find().sort("username", 1))
+    if docs:
+        df = pd.DataFrame([{
+            "ID":        str(d["_id"]),
+            "Usuario":   d["username"],
+            "Nombre":    d["full_name"],
+            "Rol":       d["role"]
+        } for d in docs])
+        st.dataframe(df, use_container_width=True)
+    else:
+        st.info("No hay usuarios registrados aún.")
+
+    st.markdown("---")
+
+    # 2) Formulario para crear un nuevo usuario
+    with st.expander("➕ Crear nuevo usuario"):
+        with st.form("form_create_user"):
+            new_user   = st.text_input("Usuario")
+            new_name   = st.text_input("Nombre completo")
+            new_role   = st.selectbox("Rol", ["admin", "doctor"])
+            new_pass   = st.text_input("Contraseña", type="password")
+            submit_new = st.form_submit_button("Crear usuario")
+
+        if submit_new:
+            if not new_user or not new_name or not new_pass:
+                st.error("Todos los campos son obligatorios.")
+            elif db.doctors.find_one({"username": new_user}):
+                st.error("Ese nombre de usuario ya existe.")
+            else:
+                pw_hash = generate_password_hash(new_pass, method="pbkdf2:sha256")
+                db.doctors.insert_one({
+                    "username":      new_user,
+                    "password_hash": pw_hash,
+                    "full_name":     new_name,
+                    "role":          new_role
+                })
+                st.success(f"Usuario **{new_user}** creado.")
+                st.rerun()
+
+    st.markdown("---")
+
+    # 3) Seleccionar un usuario para editar o borrar
+    user_options = {f"{d['username']} ({d['full_name']})": str(d["_id"]) for d in docs}
+    display_names = [""] + list(user_options.keys())
+    
+    sel = st.selectbox("Seleccionar usuario para editar / borrar", display_names)
+    if sel and sel != "":
+        selected_id = user_options[sel]
+        doc = db.doctors.find_one({"_id": ObjectId(selected_id)})
+        if doc:
+            # Usar session_state para controlar el estado del checkbox
+            if "change_pw" not in st.session_state:
+                st.session_state.change_pw = False
+
+            # Checkbox fuera del formulario para actualizar el estado dinámicamente
+            st.session_state.change_pw = st.checkbox("Cambiar contraseña", value=st.session_state.change_pw)
+
+            with st.form("form_edit_user"):
+                e_name = st.text_input("Nombre completo", value=doc["full_name"])
+                e_role = st.selectbox("Rol", ["admin", "doctor"], index=0 if doc["role"]=="admin" else 1)
+                e_pass = None
+                e_pass_confirm = None
+                if st.session_state.change_pw:
+                    e_pass = st.text_input("Nueva contraseña", type="password")
+                    e_pass_confirm = st.text_input("Confirmar nueva contraseña", type="password")
+                save = st.form_submit_button("Guardar cambios")
+
+            if save:
+                update = {"full_name": e_name, "role": e_role}
+                if st.session_state.change_pw:
+                    if not e_pass or not e_pass_confirm:
+                        st.error("Debes ingresar la nueva contraseña y su confirmación.")
+                    elif e_pass != e_pass_confirm:
+                        st.error("Las contraseñas no coinciden.")
+                    elif len(e_pass) < 8:
+                        st.error("La contraseña debe tener al menos 8 caracteres.")
+                    else:
+                        update["password_hash"] = generate_password_hash(e_pass, method="pbkdf2:sha256")
+                try:
+                    db.doctors.update_one({"_id": doc["_id"]}, {"$set": update})
+                    st.success("Usuario actualizado.")
+                    st.session_state.change_pw = False  # Resetear el checkbox
+                    st.rerun()
+                except Exception as e:
+                    st.error(f"Error al actualizar el usuario: {e}")
+
+            if st.button("🗑️ Eliminar usuario"):
+                try:
+                    db.doctors.delete_one({"_id": doc["_id"]})
+                    st.success("Usuario eliminado.")
+                    st.session_state.change_pw = False  # Resetear el checkbox
+                    st.rerun()
+                except Exception as e:
+                    st.error(f"Error al eliminar el usuario: {e}")
+
 def main():
+    # 1) Si no hay usuario en sesión, mostramos login y salimos
+    if "user" not in st.session_state:
+        login_page()
+        return
+
+    # 2) Ya autenticado: saludo y logout
+    user = st.session_state["user"]
+    st.sidebar.markdown(f"👋 Hola, **{user['full_name']}**")
+    if st.sidebar.button("Cerrar sesión"):
+        logout()
+
+    # 3) Título y descripción
     st.title("🏥 Sistema de Gestión para Detección de Stroke")
     st.markdown("Gestión de pacientes, consultas y análisis de imágenes DWI")
 
-    menu = st.sidebar.selectbox("Menú", [
-        "Gestión de Pacientes",
-        "Registrar Consulta",
-        "Ver Consultas y Estadísticas"
-    ])
+    # 4) Menú dinámico según rol
+    if user["role"] == "admin":
+        opciones = [
+            "Gestión de Usuarios",
+            "Gestión de Pacientes",
+            "Registrar Consulta",
+            "Ver Consultas y Estadísticas"
+        ]
+    else:  # doctor
+        opciones = [
+            "Gestión de Pacientes",
+            "Registrar Consulta",
+            "Ver Consultas y Estadísticas"
+        ]
 
-    if menu == "Gestión de Pacientes":
+    menu = st.sidebar.selectbox("Menú", opciones)
+
+    # 5) Ruteo de cada opción
+    if menu == "Gestión de Usuarios":
+        manage_users()             # Sólo disponible para admin
+    elif menu == "Gestión de Pacientes":
         patient_management()
     elif menu == "Registrar Consulta":
         register_consultation()
@@ -792,3 +965,5 @@ def main():
 
 if __name__ == "__main__":
     main()
+
+
