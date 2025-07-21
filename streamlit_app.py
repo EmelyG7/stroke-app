@@ -18,17 +18,13 @@ import pymongo
 from gridfs import GridFS
 from pymongo import MongoClient
 from bson.objectid import ObjectId
-
-import tempfile
-import calendar
-from datetime import datetime as dt
-from streamlit.runtime.scriptrunner import RerunException
-
+import traceback
 
 # Configuración de Streamlit
 st.set_page_config(page_title="Stroke Management App", page_icon="🏥", layout="wide")
 
 st.write("Streamlit version:", st.__version__)
+
 
 # --------------------------
 # Configuración de MongoDB
@@ -59,9 +55,11 @@ if db is None or fs is None:
     st.error("No se pudo conectar a MongoDB. Verifique la cadena de conexión.")
     st.stop()
 
-#Funciones de acceso a doctores
+
+# Funciones de acceso a doctores
 def get_doctor(username: str):
     return db.doctors.find_one({"username": username})
+
 
 def authenticate_doctor(username: str, password: str):
     doc = get_doctor(username)
@@ -69,34 +67,30 @@ def authenticate_doctor(username: str, password: str):
         return doc
     return None
 
+
 def login_page():
     st.title("🔐 Login")
     with st.form("login_form"):
         user = st.text_input("Usuario")
-        pwd  = st.text_input("Contraseña", type="password")
-        ok   = st.form_submit_button("Ingresar")
+        pwd = st.text_input("Contraseña", type="password")
+        ok = st.form_submit_button("Ingresar")
 
     if ok:
         doctor = authenticate_doctor(user, pwd)
         if doctor:
             st.session_state["user"] = {
-                "username":  doctor["username"],
+                "username": doctor["username"],
                 "full_name": doctor["full_name"],
-                "role":      doctor["role"]
+                "role": doctor["role"]
             }
             st.success("¡Bienvenido, " + doctor["full_name"] + "!")
-           #st.experimental_rerun()   
         else:
             st.error("Usuario o contraseña inválidos")
-
 
 
 def logout():
     if "user" in st.session_state:
         del st.session_state["user"]
-    #st.experimental_rerun()
-
-
 
 
 # --------------------------
@@ -104,46 +98,61 @@ def logout():
 # --------------------------
 class F1Score(tf.keras.metrics.Metric):
     def __init__(self, name='f1_score', threshold=0.5, **kwargs):
-        super().__init__(name=name, **kwargs)
-        self.threshold = threshold
-        self.true_positives = self.add_weight(name='tp', initializer='zeros')
-        self.false_positives = self.add_weight(name='fp', initializer='zeros')
-        self.false_negatives = self.add_weight(name='fn', initializer='zeros')
+        super(F1Score, self).__init__(name=name, **kwargs)
+        self.precision = tf.keras.metrics.Precision(thresholds=threshold, dtype=tf.float32)
+        self.recall = tf.keras.metrics.Recall(thresholds=threshold, dtype=tf.float32)
 
     def update_state(self, y_true, y_pred, sample_weight=None):
         y_true = tf.cast(y_true, tf.float32)
-        y_pred = tf.cast(y_pred >= self.threshold, tf.float32)
-        tp = tf.reduce_sum(y_true * y_pred)
-        fp = tf.reduce_sum((1 - y_true) * y_pred)
-        fn = tf.reduce_sum(y_true * (1 - y_pred))
-        self.true_positives.assign_add(tp)
-        self.false_positives.assign_add(fp)
-        self.false_negatives.assign_add(fn)
+        y_pred = tf.cast(y_pred, tf.float32)
+        self.precision.update_state(y_true, y_pred, sample_weight)
+        self.recall.update_state(y_true, y_pred, sample_weight)
 
     def result(self):
-        precision = self.true_positives / (self.true_positives + self.false_positives + tf.keras.backend.epsilon())
-        recall = self.true_positives / (self.true_positives + self.false_negatives + tf.keras.backend.epsilon())
-        return 2 * ((precision * recall) / (precision + recall + tf.keras.backend.epsilon()))
+        p = tf.cast(self.precision.result(), tf.float32)
+        r = tf.cast(self.recall.result(), tf.float32)
+        f1 = 2 * ((p * r) / (p + r + tf.keras.backend.epsilon()))
+        return tf.cast(f1, tf.float32)
 
     def reset_state(self):
-        self.true_positives.assign(0.)
-        self.false_positives.assign(0.)
-        self.false_negatives.assign(0.)
-
-    def get_config(self):
-        config = super().get_config()
-        config.update({"threshold": self.threshold})
-        return config
+        self.precision.reset_state()
+        self.recall.reset_state()
 
 
 @st.cache_resource
 def load_custom_model():
     try:
-        model_path = "best_densenet121_fold_5.keras"
-        model = load_model(model_path, custom_objects={'F1Score': F1Score})
+        # Define focal_loss function (same as in training script)
+        def focal_loss(gamma=3.0, alpha=0.6):
+            def focal_loss_fn(y_true, y_pred):
+                y_true = tf.cast(y_true, tf.float32)
+                y_pred = tf.cast(y_pred, tf.float32)
+                epsilon = tf.keras.backend.epsilon()
+                y_pred = tf.clip_by_value(y_pred, epsilon, 1.0 - epsilon)
+                cross_entropy = -y_true * tf.math.log(y_pred) - (1 - y_true) * tf.math.log(1 - y_pred)
+                p_t = y_true * y_pred + (1 - y_true) * (1 - y_pred)
+                modulating_factor = tf.pow(1.0 - p_t, gamma)
+                alpha_factor = y_true * tf.cast(alpha, tf.float32) + (1 - y_true) * tf.cast(1 - alpha, tf.float32)
+                loss = alpha_factor * modulating_factor * cross_entropy
+                return tf.reduce_mean(loss)
+
+            return focal_loss_fn
+
+        model_path = "best_fold_5_el_mejor_de_los_5_folds.h5"
+        tf.keras.backend.clear_session()  # Clear session to avoid conflicts
+        model = load_model(
+            model_path,
+            custom_objects={
+                'F1Score': F1Score,
+                'focal_loss_fn': focal_loss(gamma=3.0, alpha=0.6)
+            },
+            compile=True
+        )
+        print(model.summary())  # Print model summary for debugging
         return model
     except Exception as e:
         st.error(f"Error al cargar el modelo: {e}")
+        st.error(f"Traceback: {traceback.format_exc()}")
         return None
 
 
@@ -171,15 +180,23 @@ def preprocess_medical_image(image):
 
 def predict_image(image):
     try:
-        img = image.resize((240, 240))
+        # Resize to match model's expected input size (128, 128)
+        img = image.resize((128, 128))
         img_array = img_to_array(img)
 
+        # Ensure the image has 3 channels (RGB)
         if img_array.shape[-1] == 1:
             img_array = np.concatenate([img_array] * 3, axis=-1)
         elif img_array.shape[-1] == 4:
             img_array = img_array[..., :3]
 
+        # Preprocess the image
         processed_img = preprocess_medical_image(img_array)
+        # Ensure the processed image is of shape (128, 128, 3)
+        if processed_img.shape != (128, 128, 3):
+            processed_img = cv2.resize(processed_img, (128, 128))
+
+        # Predict using the model
         prediction = model.predict(np.expand_dims(processed_img, axis=0))
         predicted_class = class_labels[int(prediction[0][0] >= 0.5)]
         confidence = float(prediction[0][0]) if predicted_class == "Stroke" else 1 - float(prediction[0][0])
@@ -225,7 +242,7 @@ def add_patient(name, age, gender, smoker=False, alcoholic=False, hypertension=F
             "hypertension": hypertension,
             "diabetes": diabetes,
             "heart_disease": heart_disease,
-            "created_at": dt.now()
+            "created_at": datetime.datetime.now()
         }
         result = db.patients.insert_one(patient)
         return result.inserted_id
@@ -246,7 +263,7 @@ def get_patients():
 def add_consultation(patient_id, date, notes, diagnosis=None, probability=None):
     try:
         if isinstance(date, datetime.date):
-            date = dt.combine(date, dt.min.time())
+            date = datetime.datetime.combine(date, datetime.datetime.min.time())
 
         consultation = {
             "patient_id": patient_id,
@@ -254,7 +271,7 @@ def add_consultation(patient_id, date, notes, diagnosis=None, probability=None):
             "notes": notes,
             "diagnosis": diagnosis,
             "probability": probability,
-            "created_at": dt.now()
+            "created_at": datetime.datetime.now()
         }
         result = db.consultations.insert_one(consultation)
 
@@ -350,7 +367,7 @@ def add_image_analysis(consultation_id, image_id, diagnosis, confidence, probabi
             "diagnosis": diagnosis,
             "confidence": confidence,
             "probability": probability,
-            "created_at": dt.now()
+            "created_at": datetime.datetime.now()
         }
         result = db.image_analyses.insert_one(analysis)
         return result.inserted_id
@@ -558,7 +575,7 @@ def register_consultation():
 
     with st.form("consultation_form"):
         patient_name = st.selectbox("Paciente*", list(patient_options.keys()))
-        date = st.date_input("Fecha*", value=dt.now())
+        date = st.date_input("Fecha*", value=datetime.datetime.now())
         notes = st.text_area("Notas Médicas")
         uploaded_files = st.file_uploader("Subir Imágenes DWI*", type=["jpg", "jpeg", "png"],
                                           accept_multiple_files=True)
@@ -638,7 +655,7 @@ def register_consultation():
                             "confidence": data["confidence"],
                             "probability": data["probability"]
                         } for data in images_data],
-                        patient_data  # Pass patient data to include medical history
+                        patient_data
                     )
 
                     # Create a temporary file for the PDF
@@ -784,7 +801,7 @@ def view_consultations():
                         consultation_data['date'],
                         consultation_data['notes'],
                         images_data_for_pdf,
-                        patient_data  # Include patient medical history
+                        patient_data
                     )
 
                     # Create a temporary file for the PDF
@@ -817,20 +834,16 @@ def view_consultations():
 # --------------------------
 # Aplicación Principal
 # --------------------------
-# --------------------------
-# Aplicación Principal
-# --------------------------
-
 def manage_users():
     st.header("🔧 Gestión de Usuarios")
     # 1) Listado de usuarios existentes
     docs = list(db.doctors.find().sort("username", 1))
     if docs:
         df = pd.DataFrame([{
-            "ID":        str(d["_id"]),
-            "Usuario":   d["username"],
-            "Nombre":    d["full_name"],
-            "Rol":       d["role"]
+            "ID": str(d["_id"]),
+            "Usuario": d["username"],
+            "Nombre": d["full_name"],
+            "Rol": d["role"]
         } for d in docs])
         st.dataframe(df, use_container_width=True)
     else:
@@ -841,10 +854,10 @@ def manage_users():
     # 2) Formulario para crear un nuevo usuario
     with st.expander("➕ Crear nuevo usuario"):
         with st.form("form_create_user"):
-            new_user   = st.text_input("Usuario")
-            new_name   = st.text_input("Nombre completo")
-            new_role   = st.selectbox("Rol", ["admin", "doctor"])
-            new_pass   = st.text_input("Contraseña", type="password")
+            new_user = st.text_input("Usuario")
+            new_name = st.text_input("Nombre completo")
+            new_role = st.selectbox("Rol", ["admin", "doctor"])
+            new_pass = st.text_input("Contraseña", type="password")
             submit_new = st.form_submit_button("Crear usuario")
 
         if submit_new:
@@ -855,10 +868,10 @@ def manage_users():
             else:
                 pw_hash = generate_password_hash(new_pass, method="pbkdf2:sha256")
                 db.doctors.insert_one({
-                    "username":      new_user,
+                    "username": new_user,
                     "password_hash": pw_hash,
-                    "full_name":     new_name,
-                    "role":          new_role
+                    "full_name": new_name,
+                    "role": new_role
                 })
                 st.success(f"Usuario **{new_user}** creado.")
                 st.rerun()
@@ -868,7 +881,7 @@ def manage_users():
     # 3) Seleccionar un usuario para editar o borrar
     user_options = {f"{d['username']} ({d['full_name']})": str(d["_id"]) for d in docs}
     display_names = [""] + list(user_options.keys())
-    
+
     sel = st.selectbox("Seleccionar usuario para editar / borrar", display_names)
     if sel and sel != "":
         selected_id = user_options[sel]
@@ -883,7 +896,7 @@ def manage_users():
 
             with st.form("form_edit_user"):
                 e_name = st.text_input("Nombre completo", value=doc["full_name"])
-                e_role = st.selectbox("Rol", ["admin", "doctor"], index=0 if doc["role"]=="admin" else 1)
+                e_role = st.selectbox("Rol", ["admin", "doctor"], index=0 if doc["role"] == "admin" else 1)
                 e_pass = None
                 e_pass_confirm = None
                 if st.session_state.change_pw:
@@ -918,6 +931,7 @@ def manage_users():
                     st.rerun()
                 except Exception as e:
                     st.error(f"Error al eliminar el usuario: {e}")
+
 
 def main():
     # 1) Si no hay usuario en sesión, mostramos login y salimos
@@ -954,7 +968,7 @@ def main():
 
     # 5) Ruteo de cada opción
     if menu == "Gestión de Usuarios":
-        manage_users()             # Sólo disponible para admin
+        manage_users()  # Sólo disponible para admin
     elif menu == "Gestión de Pacientes":
         patient_management()
     elif menu == "Registrar Consulta":
@@ -965,5 +979,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
-
